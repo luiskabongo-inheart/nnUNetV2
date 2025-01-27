@@ -1,3 +1,4 @@
+import copy
 import inspect
 import multiprocessing
 import os
@@ -7,7 +8,8 @@ import warnings
 from copy import deepcopy
 from datetime import datetime
 from time import time, sleep
-from typing import Tuple, Union, List
+from typing import Tuple, Union, List, Optional, Type
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -69,6 +71,250 @@ from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
 
+from torch.nn.utils.parametrize import type_before_parametrizations
+from torch.nn import (
+    Conv1d,
+    InstanceNorm1d,
+    Conv2d,
+    InstanceNorm2d,
+    Conv3d,
+    InstanceNorm3d,
+    LeakyReLU,
+)
+import torch.nn as nn
+import torch.ao.nn.intrinsic as nni
+
+from torch.ao.nn.intrinsic.modules.fused import _FusedModule
+
+
+class ConvLeakyReLU1d(_FusedModule):
+    r"""This is a sequential container which calls the Conv 1d, Instance Norm 1d, and LeakyReLU modules.
+    During quantization this will be replaced with the corresponding fused module."""
+
+    def __init__(self, conv, leaky_relu):
+        assert (
+            type_before_parametrizations(conv) == Conv1d
+            and type_before_parametrizations(leaky_relu) == LeakyReLU
+        ), f"Incorrect types for input modules{type_before_parametrizations(conv)}{type_before_parametrizations(leaky_relu)}"
+        super().__init__(conv, leaky_relu)
+
+
+class ConvLeakyReLU2d(_FusedModule):
+    r"""This is a sequential container which calls the Conv 2d, Instance Norm 2d, and LeakyReLU modules.
+    During quantization this will be replaced with the corresponding fused module."""
+
+    def __init__(self, conv, leaky_relu):
+        assert (
+            type_before_parametrizations(conv) == Conv2d
+            and type_before_parametrizations(leaky_relu) == LeakyReLU
+        ), f"Incorrect types for input modules{type_before_parametrizations(conv)}{type_before_parametrizations(leaky_relu)}"
+        super().__init__(conv, leaky_relu)
+
+
+class ConvLeakyReLU3d(_FusedModule):
+    r"""This is a sequential container which calls the Conv 3d, Instance Norm 3d, and LeakyReLU modules.
+    During quantization this will be replaced with the corresponding fused module."""
+
+    def __init__(self, conv, leaky_relu):
+        assert (
+            type_before_parametrizations(conv) == Conv3d
+            and type_before_parametrizations(leaky_relu) == LeakyReLU
+        ), "Incorrect types for input modules{}{}{}".format(
+            type_before_parametrizations(conv),
+            type_before_parametrizations(leaky_relu),
+        )
+        super().__init__(conv, leaky_relu)
+
+
+class ConvInLeakyReLU1d(_FusedModule):
+    r"""This is a sequential container which calls the Conv 1d, Instance Norm 1d, and LeakyReLU modules.
+    During quantization this will be replaced with the corresponding fused module."""
+
+    def __init__(self, conv, _in, leaky_relu):
+        assert (
+            type_before_parametrizations(conv) == Conv1d
+            and type_before_parametrizations(_in) == InstanceNorm1d
+            and type_before_parametrizations(leaky_relu) == LeakyReLU
+        ), "Incorrect types for input modules{}{}{}".format(
+            type_before_parametrizations(conv),
+            type_before_parametrizations(_in),
+            type_before_parametrizations(leaky_relu),
+        )
+        super().__init__(conv, _in, leaky_relu)
+
+
+class ConvInLeakyReLU2d(_FusedModule):
+    r"""This is a sequential container which calls the Conv 2d, Instance Norm 2d, and LeakyReLU modules.
+    During quantization this will be replaced with the corresponding fused module."""
+
+    def __init__(self, conv, _in, leaky_relu):
+        assert (
+            type_before_parametrizations(conv) == Conv2d
+            and type_before_parametrizations(_in) == InstanceNorm2d
+            and type_before_parametrizations(leaky_relu) == LeakyReLU
+        ), "Incorrect types for input modules{}{}{}".format(
+            type_before_parametrizations(conv),
+            type_before_parametrizations(_in),
+            type_before_parametrizations(leaky_relu),
+        )
+        super().__init__(conv, _in, leaky_relu)
+
+
+class ConvInLeakyReLU3d(_FusedModule):
+    r"""This is a sequential container which calls the Conv 3d, Instance Norm 3d, and LeakyReLU modules.
+    During quantization this will be replaced with the corresponding fused module."""
+
+    def __init__(self, conv, _in, leaky_relu):
+        assert (
+            type_before_parametrizations(conv) == Conv3d
+            and type_before_parametrizations(_in) == InstanceNorm3d
+            and type_before_parametrizations(leaky_relu) == LeakyReLU
+        ), "Incorrect types for input modules{}{}{}".format(
+            type_before_parametrizations(conv),
+            type_before_parametrizations(_in),
+            type_before_parametrizations(leaky_relu),
+        )
+        super().__init__(conv, _in, leaky_relu)
+
+
+def fuse_conv_in_weights(
+    conv_w: torch.Tensor,
+    conv_b: Optional[torch.Tensor],
+    bn_rm: torch.Tensor,
+    bn_rv: torch.Tensor,
+    bn_eps: float,
+    bn_w: Optional[torch.Tensor],
+    bn_b: Optional[torch.Tensor],
+    transpose: bool = False,
+) -> Tuple[torch.nn.Parameter, torch.nn.Parameter]:
+    r"""Fuse convolutional module parameters and BatchNorm module parameters into new convolutional module parameters.
+
+    Args:
+        conv_w (torch.Tensor): Convolutional weight.
+        conv_b (Optional[torch.Tensor]): Convolutional bias.
+        bn_rm (torch.Tensor): BatchNorm running mean.
+        bn_rv (torch.Tensor): BatchNorm running variance.
+        bn_eps (float): BatchNorm epsilon.
+        bn_w (Optional[torch.Tensor]): BatchNorm weight.
+        bn_b (Optional[torch.Tensor]): BatchNorm bias.
+        transpose (bool, optional): If True, transpose the conv weight. Defaults to False.
+
+    Returns:
+        Tuple[torch.nn.Parameter, torch.nn.Parameter]: Fused convolutional weight and bias.
+    """
+    conv_weight_dtype = conv_w.dtype
+    conv_bias_dtype = conv_b.dtype if conv_b is not None else conv_weight_dtype
+    if conv_b is None:
+        conv_b = torch.zeros_like(bn_rm)
+    if bn_w is None:
+        bn_w = torch.ones_like(bn_rm)
+    if bn_b is None:
+        bn_b = torch.zeros_like(bn_rm)
+    bn_var_rsqrt = torch.rsqrt(bn_rv + bn_eps)
+
+    if transpose:
+        shape = [1, -1] + [1] * (len(conv_w.shape) - 2)
+    else:
+        shape = [-1, 1] + [1] * (len(conv_w.shape) - 2)
+
+    fused_conv_w = (conv_w * (bn_w * bn_var_rsqrt).reshape(shape)).to(
+        dtype=conv_weight_dtype
+    )
+    fused_conv_b = ((conv_b - bn_rm) * bn_var_rsqrt * bn_w + bn_b).to(
+        dtype=conv_bias_dtype
+    )
+
+    return (
+        torch.nn.Parameter(fused_conv_w, conv_w.requires_grad),
+        torch.nn.Parameter(fused_conv_b, conv_b.requires_grad),
+    )
+
+
+# def fuse_conv_in_leakyrelu_eval(conv: ConvT, _in: torch.nn.modules.batchnorm._InstanceNorm, transpose: bool = False) -> ConvT:
+#     r"""Fuse a convolutional module and a InstanceNorm module into a single, new convolutional module.
+#
+#     Args:
+#         conv (torch.nn.modules.conv._ConvNd): A convolutional module.
+#         _in (torch.nn.modules.batchnorm._BatchNorm): A BatchNorm module.
+#         transpose (bool, optional): If True, transpose the convolutional weight. Defaults to False.
+#
+#     Returns:
+#         torch.nn.modules.conv._ConvNd: The fused convolutional module.
+#
+#     .. note::
+#         Both ``conv`` and ``_in`` must be in eval mode, and ``_in`` must have its running buffers computed.
+#     """
+# assert not (conv.training or _in.training), "Fusion only for eval!"
+# fused_conv = copy.deepcopy(conv)
+#
+# assert _in.running_mean is not None and _in.running_var is not None
+# fused_conv.weight, fused_conv.bias = fuse_conv_in_weights(
+#     fused_conv.weight, fused_conv.bias,
+#     _in.running_mean, _in.running_var, _in.eps, _in.weight, _in.bias, transpose)
+#
+# return fused_conv
+def fuse_conv_in_leakyrelu(is_qat, conv, _in, leaky_relu):
+    assert (
+        conv.training == _in.training == leaky_relu.training
+    ), "Conv and BN both must be in the same mode (train or eval)."
+    fused_module: Optional[Type[nn.Sequential]] = None
+    if is_qat:
+        map_to_fused_module_train = {
+            nn.Conv1d: ConvInLeakyReLU1d,
+            nn.Conv2d: ConvInLeakyReLU2d,
+            nn.Conv3d: ConvInLeakyReLU3d,
+        }
+        assert (
+            _in.num_features == conv.out_channels
+        ), "Output channel of Conv must match num_features of BatchNorm"
+        assert _in.affine, "Only support fusing BatchNorm with affine set to True"
+        assert (
+            _in.track_running_stats
+        ), "Only support fusing BatchNorm with tracking_running_stats set to True"
+        fused_module = map_to_fused_module_train.get(type(conv), None)
+        if fused_module is not None:
+            return fused_module(conv, _in, leaky_relu)
+        else:
+            raise NotImplementedError(
+                f"Cannot fuse train modules: {(conv, _in, leaky_relu)}"
+            )
+    else:
+        map_to_fused_module_eval = {
+            nn.Conv1d: ConvLeakyReLU1d,
+            nn.Conv2d: ConvLeakyReLU2d,
+            nn.Conv3d: ConvLeakyReLU3d,
+        }
+        fused_module = map_to_fused_module_eval.get(type(conv), None)
+        if fused_module is not None:
+            fused_conv = nn.utils.fusion.fuse_conv_bn_eval(conv, _in)
+            return fused_module(fused_conv, leaky_relu)
+        else:
+            raise NotImplementedError(
+                f"Cannot fuse eval modules: {(conv, _in, leaky_relu)}"
+            )
+
+
+# def fuse_conv_in_leakyrelu(is_qat, conv, _in, leaky_relu):
+#     assert(conv.training == _in.training == leaky_relu.training),\
+#         "Conv & IN & LeakyReLU must all be in the same mode (train or eval)."
+#
+#     fused_module_class_map = {
+#         nn.Conv3d: ConvInLeakyReLU3d,
+#     }
+#
+#     if is_qat:
+#         assert _in.num_features == conv.out_channels, 'Output channel of Conv3d must match num_features of InstanceNorm3d'
+#         assert _in.affine, 'Only support fusing InstanceNorm3d with affine set to True'
+#         assert _in.track_running_stats, 'Only support fusing InstanceNorm3d with tracking_running_stats set to True'
+#         fused_module_class = fused_module_class_map.get((type(conv)), None)
+#         if fused_module_class is not None:
+#             return fused_module_class(conv, _in, leaky_relu)
+#         else:
+#             raise NotImplementedError(f"Cannot fuse train modules: {(conv, _in, leaky_relu)}")
+#     else:
+#         return fuse_conv_bn_leakyrelu_eval(conv, _in, leaky_relu)
+
+
 class nnUNetTrainer(object):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
@@ -110,7 +356,7 @@ class nnUNetTrainer(object):
         # would also pickle the network etc. Bad, bad. Instead we just reinstantiate and then load the checkpoint we
         # need. So let's save the init args
         self.my_init_kwargs = {}
-        for k in inspect.signature(self.__init__).parameters.keys():
+        for k in inspect.signature(nnUNetTrainer.__init__).parameters.keys():
             self.my_init_kwargs[k] = locals()[k]
 
         ###  Saving all the init args into class variables for later access
@@ -215,6 +461,41 @@ class nnUNetTrainer(object):
                 self.label_manager.num_segmentation_heads,
                 self.enable_deep_supervision
             ).to(self.device)
+
+            qat_model = copy.deepcopy(self.network)
+            # qat_model.fuse_model(is_qat=True)
+
+            fuse_modules = (
+                torch.ao.quantization.fuse_modules_qat
+                if self.use_qat
+                else torch.ao.quantization.fuse_modules
+            )
+
+            fuse_custom_config_dict = {
+                # Additional fuser_method mapping
+                "additional_fuser_method_mapping": {
+                    (
+                        torch.nn.Conv3d,
+                        torch.nn.InstanceNorm3d,
+                        torch.nn.LeakyReLU,
+                    ): fuse_conv_in_leakyrelu
+                }
+            }
+
+            for n, m in qat_model.named_modules():
+                if n.endswith("conv"):
+                    sub = qat_model.get_submodule(".".join(n.split(".")[:-1]))
+                    fuse_modules(
+                        sub,
+                        [["conv", "norm", "nonlin"]],
+                        inplace=True,
+                        fuse_custom_config_dict=fuse_custom_config_dict,
+                    )
+
+            qat_model.qconfig = torch.ao.quantization.get_default_qat_qconfig("x86")
+            torch.ao.quantization.prepare_qat(qat_model, inplace=True)
+            self.network = qat_model
+
             # compile network for free speedup
             if self._do_i_compile():
                 self.print_to_log_file('Using torch.compile...')
@@ -1262,6 +1543,10 @@ class nnUNetTrainer(object):
             results = []
 
             for i, k in enumerate(dataset_val.keys()):
+                if Path(join(join(self.output_folder_base, 'predicted_next_stage', "3d_cascade_fullres"), k + '.npz')).exists():
+                    continue
+                if Path(join(validation_output_folder, k+'.mha')).exists():
+                    continue
                 proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list, results,
                                                            allowed_num_queued=2)
                 while not proceed:
@@ -1359,24 +1644,25 @@ class nnUNetTrainer(object):
         compute_gaussian.cache_clear()
 
     def run_training(self):
-        self.on_train_start()
+        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+            self.on_train_start()
 
-        for epoch in range(self.current_epoch, self.num_epochs):
-            self.on_epoch_start()
+            for epoch in range(self.current_epoch, self.num_epochs):
+                self.on_epoch_start()
 
-            self.on_train_epoch_start()
-            train_outputs = []
-            for batch_id in range(self.num_iterations_per_epoch):
-                train_outputs.append(self.train_step(next(self.dataloader_train)))
-            self.on_train_epoch_end(train_outputs)
+                self.on_train_epoch_start()
+                train_outputs = []
+                for batch_id in range(self.num_iterations_per_epoch):
+                    train_outputs.append(self.train_step(next(self.dataloader_train)))
+                self.on_train_epoch_end(train_outputs)
 
-            with torch.no_grad():
-                self.on_validation_epoch_start()
-                val_outputs = []
-                for batch_id in range(self.num_val_iterations_per_epoch):
-                    val_outputs.append(self.validation_step(next(self.dataloader_val)))
-                self.on_validation_epoch_end(val_outputs)
+                with torch.no_grad():
+                    self.on_validation_epoch_start()
+                    val_outputs = []
+                    for batch_id in range(self.num_val_iterations_per_epoch):
+                        val_outputs.append(self.validation_step(next(self.dataloader_val)))
+                    self.on_validation_epoch_end(val_outputs)
 
-            self.on_epoch_end()
+                self.on_epoch_end()
 
-        self.on_train_end()
+            self.on_train_end()
